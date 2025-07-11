@@ -281,82 +281,108 @@ def training_loop(
         if phase.end_event is not None:
             phase.end_event.record(torch.cuda.current_stream(device))
         
+    G_params = []
+    D_params = []
     while True:
-        # Fetch training data.
-        with torch.autograd.profiler.record_function('data_fetch'):
-            D_img, D_img_c = next(training_set_iterator)
-            D_z = torch.randn([batch_size, G.z_dim], device=device)
-            
-            G_img, G_img_c = next(training_set_iterator)
-            G_z = torch.randn([batch_size, G.z_dim], device=device)
-            
-            all_real_img = []
-            all_real_c = []
-            all_gen_z = []
-            
-            # D
-            all_real_img += [(D_img.detach().clone().to(device).to(torch.float32) / 127.5 - 1).split(d_batch_gpu)]
-            all_real_c += [D_img_c.detach().clone().to(device).split(d_batch_gpu)]
-            all_gen_z += [D_z.detach().clone().split(d_batch_gpu)]
-            
-            # G
-            all_real_img += [(G_img.detach().clone().to(device).to(torch.float32) / 127.5 - 1).split(g_batch_gpu)]
-            all_real_c += [G_img_c.detach().clone().to(device).split(g_batch_gpu)]
-            all_gen_z += [G_z.detach().clone().split(g_batch_gpu)]
-            
-        cur_lr = cosine_decay_with_warmup(cur_nimg, **lr_scheduler)
-        cur_beta2 = cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
-        cur_gamma = cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
-        cur_ema_nimg = cosine_decay_with_warmup(cur_nimg, **ema_scheduler)
-        cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
-        
-        if augment_pipe is not None:
-            augment_pipe.p.copy_(misc.constant(cur_aug_p, device=device))
-        
-        # Execute training phases.
-        for phase, phase_gen_z, phase_real_img, phase_real_c in zip(phases, all_gen_z, all_real_img, all_real_c):
-            if phase.start_event is not None:
-                phase.start_event.record(torch.cuda.current_stream(device))
+        for extra_grad in range(2) :
+            # Fetch training data. 
+            if extra_grad == 0 : 
+                G_params.clear()
+                D_params.clear()
+                for W in G.parameters() :
+                    G_params.append(W.clone().detach())
+                for W in D.parameters() :
+                    D_params.append(W.clone().detach())
+            else :
+                with torch.no_grad():
+                    for W, W0 in zip(G.parameters(), G_params) :
+                        W0.sub_(W)
+                    for W, W0 in zip(D.parameters(), D_params) :
+                        W0.sub_(W) 
 
-            # Accumulate gradients.
-            phase.opt.zero_grad(set_to_none=True)
-            phase.module.requires_grad_(True)
-            for real_img, real_c, gen_z in zip(phase_real_img, phase_real_c, phase_gen_z):
-                loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gamma=cur_gamma, gain=num_gpus * phase.batch_gpu / batch_size)
-            phase.module.requires_grad_(False)
-        
-            # Update weights.  
-            for g in phase.opt.param_groups:
-                g['lr'] = cur_lr
-                g['betas'] = (0.0, cur_beta2)
-                      
-            with torch.autograd.profiler.record_function(phase.name + '_opt'):
-                params = [param for param in phase.module.parameters() if param.grad is not None]
-                if len(params) > 0:
-                    flat = torch.cat([param.grad.flatten() for param in params])
-                    if num_gpus > 1:
-                        torch.distributed.all_reduce(flat)
-                        flat /= num_gpus
-                    grads = flat.split([param.numel() for param in params])
-                    for param, grad in zip(params, grads):
-                        param.grad = grad.reshape(param.shape)
-                phase.opt.step()
+            with torch.autograd.profiler.record_function('data_fetch'):
+                D_img, D_img_c = next(training_set_iterator)
+                D_z = torch.randn([batch_size, G.z_dim], device=device)
+                
+                G_img, G_img_c = next(training_set_iterator)
+                G_z = torch.randn([batch_size, G.z_dim], device=device)
+                
+                all_real_img = []
+                all_real_c = []
+                all_gen_z = []
+                
+                # D
+                all_real_img += [(D_img.detach().clone().to(device).to(torch.float32) / 127.5 - 1).split(d_batch_gpu)]
+                all_real_c += [D_img_c.detach().clone().to(device).split(d_batch_gpu)]
+                all_gen_z += [D_z.detach().clone().split(d_batch_gpu)]
+                
+                # G
+                all_real_img += [(G_img.detach().clone().to(device).to(torch.float32) / 127.5 - 1).split(g_batch_gpu)]
+                all_real_c += [G_img_c.detach().clone().to(device).split(g_batch_gpu)]
+                all_gen_z += [G_z.detach().clone().split(g_batch_gpu)]
+                
+            cur_lr = cosine_decay_with_warmup(cur_nimg, **lr_scheduler)
+            cur_beta2 = cosine_decay_with_warmup(cur_nimg, **beta2_scheduler)
+            cur_gamma = cosine_decay_with_warmup(cur_nimg, **gamma_scheduler)
+            cur_ema_nimg = cosine_decay_with_warmup(cur_nimg, **ema_scheduler)
+            cur_aug_p = cosine_decay_with_warmup(cur_nimg, **aug_scheduler)
+            
+            if augment_pipe is not None:
+                augment_pipe.p.copy_(misc.constant(cur_aug_p, device=device))
+            
+            # Execute training phases.
+            for phase, phase_gen_z, phase_real_img, phase_real_c in zip(phases, all_gen_z, all_real_img, all_real_c):
+                if phase.start_event is not None:
+                    phase.start_event.record(torch.cuda.current_stream(device))
 
-            # Phase done.
-            if phase.end_event is not None:
-                phase.end_event.record(torch.cuda.current_stream(device))
+                # Accumulate gradients.
+                phase.opt.zero_grad(set_to_none=True)
+                phase.module.requires_grad_(True)
+                for real_img, real_c, gen_z in zip(phase_real_img, phase_real_c, phase_gen_z):
+                    loss.accumulate_gradients(phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gamma=cur_gamma, gain=num_gpus * phase.batch_gpu / batch_size)
+                phase.module.requires_grad_(False)
+            
+                # Update weights.  
+                if extra_grad == 0 :
+                    # update hyperparams if extrapolation step
+                    for g in phase.opt.param_groups:
+                        g['lr'] = cur_lr
+                        g['betas'] = (0.0, cur_beta2)
 
-        # Update G_ema.
-        with torch.autograd.profiler.record_function('Gema'):
-            ema_beta = 0.5 ** (batch_size / max(cur_ema_nimg, 1e-8))
-            for p_ema, p in zip(G_ema.parameters(), G.parameters()):
-                p_ema.copy_(p.lerp(p_ema, ema_beta))
-            for b_ema, b in zip(G_ema.buffers(), G.buffers()):
-                b_ema.copy_(b)
+                with torch.autograd.profiler.record_function(phase.name + '_opt'):
+                    params = [param for param in phase.module.parameters() if param.grad is not None]
+                    if len(params) > 0:
+                        flat = torch.cat([param.grad.flatten() for param in params])
+                        if num_gpus > 1:
+                            torch.distributed.all_reduce(flat)
+                            flat /= num_gpus
+                        grads = flat.split([param.numel() for param in params])
+                        for param, grad in zip(params, grads):
+                            param.grad = grad.reshape(param.shape)
+                    phase.opt.step()
 
-        # Update state.
-        cur_nimg += batch_size
-        batch_idx += 1
+                # Phase done.
+                if phase.end_event is not None:
+                    phase.end_event.record(torch.cuda.current_stream(device))
+            
+            if extra_grad == 1 :
+                with torch.no_grad(): 
+                    for W, W0 in zip(G.parameters(), G_params) :
+                        W.add_(W0)
+                    for W, W0 in zip(D.parameters(), D_params) :
+                        W.add_(W0) 
+
+                # Update G_ema. 
+                with torch.autograd.profiler.record_function('Gema'):
+                    ema_beta = 0.5 ** (batch_size / max(cur_ema_nimg, 1e-8))
+                    for p_ema, p in zip(G_ema.parameters(), G.parameters()):
+                        p_ema.copy_(p.lerp(p_ema, ema_beta))
+                    for b_ema, b in zip(G_ema.buffers(), G.buffers()):
+                        b_ema.copy_(b)
+
+            # Update state.
+            cur_nimg += batch_size
+            batch_idx += 1
 
         # Perform maintenance tasks once per tick.
         done = (cur_nimg >= total_kimg * 1000)
